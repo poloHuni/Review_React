@@ -26,7 +26,7 @@ export function AuthProvider({ children }) {
   const [error, setError] = useState('');
   const [isOwner, setIsOwner] = useState(false);
 
-  async function register(name, email, phone, restaurantId = 'default_restaurant') {
+  async function register(name, email, password, phone, restaurantId = 'default_restaurant') {
     try {
       setError('');
       const userCredential = await createUserWithEmailAndPassword(auth, email, password);

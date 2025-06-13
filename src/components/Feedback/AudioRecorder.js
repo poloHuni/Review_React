@@ -5,7 +5,7 @@ import { storage } from '../../firebase/config';
 import { useAuth } from '../../contexts/AuthContext';
 import { v4 as uuidv4 } from 'uuid';
 
-const AudioRecorder = ({ onAudioSaved, restaurantId }) => {
+const AudioRecorder = ({ onAudioSaved, restaurantId, onProcessingStart }) => {
   const [isRecording, setIsRecording] = useState(false);
   const [recordingComplete, setRecordingComplete] = useState(false);
   const [audioBlob, setAudioBlob] = useState(null);
@@ -56,14 +56,40 @@ const AudioRecorder = ({ onAudioSaved, restaurantId }) => {
       };
       
       mediaRecorder.onstop = () => {
-        const audioBlob = new Blob(chunksRef.current, { type: 'audio/wav' });
-        setAudioBlob(audioBlob);
-        const url = URL.createObjectURL(audioBlob);
-        setAudioUrl(url);
-        setRecordingComplete(true);
+        if (chunksRef.current.length === 0) {
+          setError("No audio data was recorded. Please try again.");
+          return;
+        }
+        
+        // Create the blob from the chunks
+        try {
+          const blob = new Blob(chunksRef.current, { type: 'audio/wav' });
+          
+          if (blob.size === 0) {
+            setError("Recorded audio is empty. Please try again.");
+            return;
+          }
+          
+          // Set the state and create the URL
+          setAudioBlob(blob);
+          const url = URL.createObjectURL(blob);
+          setAudioUrl(url);
+          setRecordingComplete(true);
+          
+          // IMPORTANT: Call onAudioSaved immediately when recording completes
+          // This ensures the parent component has the audio data right away
+          onAudioSaved(blob, url);
+        } catch (blobErr) {
+          setError(`Failed to create audio blob: ${blobErr.message}`);
+        }
         
         // Release microphone
         stream.getTracks().forEach(track => track.stop());
+      };
+      
+      // Add error event handler to MediaRecorder
+      mediaRecorder.onerror = (err) => {
+        setError(`MediaRecorder error: ${err.message}`);
       };
       
       // Start the timer
@@ -79,18 +105,22 @@ const AudioRecorder = ({ onAudioSaved, restaurantId }) => {
         });
       }, 1000);
       
-      mediaRecorder.start();
+      // Start recording
+      mediaRecorder.start(100); // Collect data in 100ms chunks
       setIsRecording(true);
     } catch (err) {
       setError(`Microphone access error: ${err.message}. Please check your browser permissions.`);
-      console.error('Error accessing microphone:', err);
     }
   };
 
   const stopRecording = () => {
     if (mediaRecorderRef.current && isRecording) {
-      mediaRecorderRef.current.stop();
-      setIsRecording(false);
+      try {
+        mediaRecorderRef.current.stop();
+        setIsRecording(false);
+      } catch (err) {
+        setError(`Error stopping recording: ${err.message}`);
+      }
       
       // Clear the timer
       if (timerRef.current) {
@@ -100,27 +130,45 @@ const AudioRecorder = ({ onAudioSaved, restaurantId }) => {
     }
   };
 
-  const processRecording = async () => {
-    if (!audioBlob) return;
+  // Function to analyze the recording
+  const analyzeRecording = () => {
+    // Double-check if we have a valid audio blob
+    if (!audioBlob || audioBlob.size === 0) {
+      setError('No audio recording found. Please try recording again.');
+      return;
+    }
     
     setProcessing(true);
+    
     try {
-      // Generate a unique filename with restaurant ID and timestamp
+      // Start the analysis process immediately
+      if (onProcessingStart) {
+        onProcessingStart();
+      }
+      
+      // Handle the upload in the background
+      uploadInBackground();
+    } catch (err) {
+      setError(`Failed to analyze recording: ${err.message}`);
+      setProcessing(false);
+    }
+  };
+  
+  // Function to handle background upload
+  const uploadInBackground = async () => {
+    try {
+      // Generate a unique filename
       const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const filename = `review_${restaurantId}_${currentUser.user_id}_${timestamp}.wav`;
+      const userId = currentUser?.uid || currentUser?.user_id || 'anonymous';
+      const filename = `review_${restaurantId}_${userId}_${timestamp}.wav`;
       
       // Upload to Firebase Storage
       const storageRef = ref(storage, `audio_recordings/${filename}`);
-      const uploadResult = await uploadBytes(storageRef, audioBlob);
-      const downloadUrl = await getDownloadURL(uploadResult.ref);
-      
-      // Call the parent component's callback with the download URL
-      onAudioSaved(audioBlob, downloadUrl);
+      await uploadBytes(storageRef, audioBlob);
+      await getDownloadURL(storageRef);
     } catch (err) {
-      setError(`Failed to process recording: ${err.message}`);
-      console.error('Error processing recording:', err);
-    } finally {
-      setProcessing(false);
+      console.error('Background upload error:', err);
+      // Don't surface this error to the user since analysis is the priority
     }
   };
 
@@ -136,7 +184,8 @@ const AudioRecorder = ({ onAudioSaved, restaurantId }) => {
       <div className="flex flex-col items-center space-y-4">
         {error && (
           <div className="w-full p-3 bg-red-900 text-white rounded-md">
-            {error}
+            <p className="font-bold">Error</p>
+            <p>{error}</p>
           </div>
         )}
         
@@ -202,7 +251,9 @@ const AudioRecorder = ({ onAudioSaved, restaurantId }) => {
               <span className="text-2xl mr-3">✅</span>
               <div>
                 <p className="text-gray-200 font-medium">Recording completed!</p>
-                <p className="text-gray-400 text-sm mt-1">Ready for next steps.</p>
+                <p className="text-gray-400 text-sm mt-1">
+                  Review your recording below.
+                </p>
               </div>
             </div>
             
@@ -212,9 +263,13 @@ const AudioRecorder = ({ onAudioSaved, restaurantId }) => {
             
             <div className="grid grid-cols-2 gap-3 mt-4">
               <button
-                onClick={processRecording}
-                disabled={processing}
-                className="py-2 px-4 bg-blue-600 hover:bg-blue-700 text-white rounded-md flex items-center justify-center"
+                onClick={analyzeRecording}
+                disabled={processing || !audioBlob}
+                className={`py-2 px-4 text-white rounded-md flex items-center justify-center ${
+                  audioBlob && !processing 
+                    ? 'bg-blue-600 hover:bg-blue-700' 
+                    : 'bg-blue-900 cursor-not-allowed'
+                }`}
               >
                 {processing ? (
                   <>
@@ -222,10 +277,10 @@ const AudioRecorder = ({ onAudioSaved, restaurantId }) => {
                       <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4"></circle>
                       <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4zm2 5.291A7.962 7.962 0 014 12H0c0 3.042 1.135 5.824 3 7.938l3-2.647z"></path>
                     </svg>
-                    Processing...
+                    Analyzing...
                   </>
                 ) : (
-                  <>✅ Process Recording</>
+                  <>🔍 Analyze Feedback</>
                 )}
               </button>
               <button

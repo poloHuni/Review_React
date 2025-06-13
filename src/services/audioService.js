@@ -1,51 +1,290 @@
 // src/services/audioService.js
 import axios from 'axios';
 
-// Function to transcribe audio using Lelapa API
-export const transcribeAudio = async (audioFile) => {
-  const formData = new FormData();
-  formData.append('file', audioFile);
-
+// Function to transcribe audio using Lelapa API with better error handling and retries
+export const transcribeAudio = async (audioBlob) => {
   try {
+    console.log('Starting transcription with blob size:', audioBlob.size);
+    console.log('Audio blob type:', audioBlob.type);
+    
+    // DIRECT OPENAI API ATTEMPT FIRST
+    try {
+      const transcription = await transcribeWithOpenAI(audioBlob);
+      if (transcription && transcription.length > 10) {
+        console.log('OpenAI transcription success:', transcription);
+        return transcription;
+      }
+    } catch (err) {
+      console.warn('OpenAI transcription failed, trying alternatives:', err.message);
+    }
+    
+    // Create form data for Lelapa API call
+    const formData = new FormData();
+    formData.append('file', audioBlob);
+
+    // Set timeout to 60 seconds for large audio files
+    const timeout = 90000; // Increased timeout
+    
+    // Get the API token either from env vars or window global
+    const apiToken = process.env.REACT_APP_LELAPA_API_TOKEN || window.LELAPA_API_TOKEN;
+    
+    // Get OpenAI token
+    const openaiToken = process.env.REACT_APP_OPENAI_API_KEY || window.OPENAI_API_KEY;
+    
+    console.log('Attempting API transcription with Lelapa token available:', !!apiToken);
+    
+    // Promise.race implementation for multiple transcription attempts
+    const transcriptionPromises = [];
+    
+    // Promise for Lelapa API
+    const lelapaPromise = new Promise(async (resolve) => {
+      try {
+        if (!apiToken) {
+          console.warn('No Lelapa API token available');
+          resolve(null);
+          return;
+        }
+        
+        console.log('Sending request to Lelapa API...');
+        const response = await axios.post(
+          'https://vulavula-services.lelapa.ai/api/v2alpha/transcribe/sync/file',
+          formData,
+          {
+            headers: {
+              'X-CLIENT-TOKEN': apiToken,
+              'Content-Type': 'multipart/form-data',
+            },
+            timeout: timeout
+          }
+        );
+        
+        console.log('Lelapa API Response status:', response.status);
+  
+        if (response.status === 200) {
+          console.log('Raw Lelapa API response:', response.data);
+          
+          // Extract transcription text from response
+          const transcriptionText = response.data.transcription_text || 
+                                response.data.transcription || 
+                                response.data.text ||
+                                '';
+                                
+          if (!transcriptionText || transcriptionText.trim() === '') {
+            console.warn('Received empty transcription from Lelapa API');
+            resolve(null);
+          } else {
+            console.log('Successfully transcribed with Lelapa:', transcriptionText);
+            resolve(transcriptionText);
+          }
+        } else {
+          console.warn(`Lelapa API returned status ${response.status}`);
+          resolve(null);
+        }
+      } catch (err) {
+        console.error('Error in Lelapa API transcription:', err.message);
+        resolve(null);
+      }
+    });
+    
+    // Promise for browser transcription
+    const browserPromise = new Promise(async (resolve) => {
+      try {
+        const browserResult = await tryBrowserTranscription(audioBlob);
+        if (browserResult && browserResult.trim() !== '') {
+          console.log('Browser transcription succeeded:', browserResult);
+          resolve(browserResult);
+        } else {
+          console.warn('Browser transcription failed');
+          resolve(null);
+        }
+      } catch (err) {
+        console.error('Error in browser transcription:', err.message);
+        resolve(null);
+      }
+    });
+    
+    // Add the promises to the array
+    transcriptionPromises.push(lelapaPromise);
+    transcriptionPromises.push(browserPromise);
+    
+    // Wait for all promises to complete and use the first valid result
+    const results = await Promise.all(transcriptionPromises);
+    
+    for (const result of results) {
+      if (result && result.trim() !== '' && result.length > 10) {
+        return result;
+      }
+    }
+    
+    // If we've reached this point, all transcription attempts failed
+    console.warn('All transcription methods failed');
+    
+    // Use a more descriptive message that won't be mistaken for actual transcription
+    return "Speech transcription failed. Please try recording again with clearer speech or using the text input option instead.";
+    
+  } catch (error) {
+    console.error('General transcription error:', error);
+    return "An error occurred during transcription. Please try again or use text input.";
+  }
+};
+
+// Direct transcription using OpenAI Whisper API
+async function transcribeWithOpenAI(audioBlob) {
+  try {
+    console.log('Attempting OpenAI Whisper transcription...');
+    
+    // Get OpenAI token - use the one from environment or fallback
+    const openaiToken = process.env.REACT_APP_OPENAI_API_KEY || window.OPENAI_API_KEY;
+    
+    if (!openaiToken) {
+      console.warn('No OpenAI token available');
+      return null;
+    }
+    
+    // Create form data for the request
+    const formData = new FormData();
+    
+    // Convert to mp3 if needed (Whisper prefers mp3)
+    let fileToSend = audioBlob;
+    if (audioBlob.type !== 'audio/mp3' && audioBlob.type !== 'audio/mpeg') {
+      console.log('Audio is not mp3, using as-is');
+      // In a production app, you would convert to mp3 here
+    }
+    
+    // Add the file to form data
+    formData.append('file', fileToSend, 'recording.mp3');
+    formData.append('model', 'whisper-1');
+    formData.append('language', 'en');
+    
+    console.log('Sending request to OpenAI Whisper API...');
     const response = await axios.post(
-      'https://vulavula-services.lelapa.ai/api/v2alpha/transcribe/sync/file',
+      'https://api.openai.com/v1/audio/transcriptions',
       formData,
       {
         headers: {
-          'X-CLIENT-TOKEN': process.env.REACT_APP_LELAPA_API_TOKEN,
-          'Content-Type': 'multipart/form-data',
+          'Authorization': `Bearer ${openaiToken}`,
+          'Content-Type': 'multipart/form-data'
         },
+        timeout: 60000
       }
     );
-
-    if (response.status === 200) {
-      // Extract transcription text from response
-      const transcriptionText = response.data.transcription_text || 
-                               response.data.transcription || 
-                               '';
-      return transcriptionText;
+    
+    console.log('OpenAI Whisper API response:', response.data);
+    
+    if (response.data && response.data.text) {
+      return response.data.text;
     } else {
-      throw new Error(`Transcription error: ${response.status}`);
+      console.warn('OpenAI Whisper API returned no text');
+      return null;
     }
   } catch (error) {
-    console.error('Error transcribing audio:', error);
-    throw new Error(`Failed to transcribe audio: ${error.message}`);
+    console.error('Error using OpenAI Whisper API:', error);
+    return null;
   }
-};
+}
+
+// Try using the browser's built-in speech recognition (works in Chrome)
+async function tryBrowserTranscription(audioBlob) {
+  return new Promise((resolve) => {
+    try {
+      console.log('Attempting browser transcription...');
+      
+      // Check if the browser supports speech recognition
+      if (!window.webkitSpeechRecognition && !window.SpeechRecognition) {
+        console.log('Browser speech recognition not supported');
+        return resolve(null);
+      }
+      
+      // Create audio element to play the blob
+      const audio = new Audio();
+      audio.src = URL.createObjectURL(audioBlob);
+      
+      // Set up speech recognition
+      const SpeechRecognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+      const recognition = new SpeechRecognition();
+      recognition.lang = 'en-US';
+      recognition.continuous = true;
+      recognition.interimResults = false;
+      
+      let transcription = '';
+      let recognitionTimeout;
+      
+      recognition.onresult = (event) => {
+        console.log('Got speech recognition result');
+        for (let i = event.resultIndex; i < event.results.length; i++) {
+          transcription += event.results[i][0].transcript + ' ';
+          console.log(`Partial transcription: ${transcription}`);
+        }
+      };
+      
+      recognition.onerror = (error) => {
+        console.error('Speech recognition error:', error);
+        clearTimeout(recognitionTimeout);
+        recognition.stop();
+        audio.pause();
+        resolve(null);
+      };
+      
+      recognition.onend = () => {
+        clearTimeout(recognitionTimeout);
+        audio.pause();
+        console.log('Browser transcription complete:', transcription);
+        resolve(transcription.trim());
+      };
+      
+      // Start playback and recognition
+      audio.onplay = () => {
+        console.log('Starting speech recognition...');
+        recognition.start();
+      };
+      
+      audio.onended = () => {
+        // Give recognition a moment to process the final words
+        console.log('Audio playback ended, stopping recognition soon...');
+        setTimeout(() => {
+          recognition.stop();
+        }, 1000);
+      };
+      
+      // Set a timeout in case something goes wrong
+      recognitionTimeout = setTimeout(() => {
+        console.warn('Browser transcription timeout');
+        recognition.stop();
+        audio.pause();
+        resolve(null);
+      }, 30000);
+      
+      console.log('Starting audio playback for transcription...');
+      audio.play().catch(err => {
+        console.error('Error playing audio for transcription:', err);
+        resolve(null);
+      });
+    } catch (error) {
+      console.error('Error with browser transcription:', error);
+      resolve(null);
+    }
+  });
+}
 
 // Function to apply audio processing to improve quality before transcription
 export const processAudio = async (audioBlob) => {
   try {
-    // In the full implementation, you would apply audio processing here
-    // For now, we'll just return the original audio blob
-    // Advanced audio processing requires Web Audio API manipulations
+    console.log('Processing audio before transcription...');
     
-    // This would include:
-    // - Normalization
-    // - Noise reduction
-    // - High-pass filtering
-    // But this is complex to implement in the browser
+    // Check if the audio blob is valid
+    if (!audioBlob || audioBlob.size === 0) {
+      console.warn('Invalid audio blob');
+      return audioBlob;
+    }
     
+    // Convert to proper format if needed
+    const blobType = audioBlob.type;
+    console.log('Original audio format:', blobType);
+    
+    // In a real implementation, you would have audio processing logic here
+    // For now, just return the original blob
+    
+    console.log('Audio processing complete, size:', audioBlob.size);
     return audioBlob;
   } catch (error) {
     console.error('Error processing audio:', error);
@@ -54,171 +293,10 @@ export const processAudio = async (audioBlob) => {
   }
 };
 
-// src/services/openaiService.js
-import axios from 'axios';
-
-// Function to analyze transcribed text and generate review
-export const analyzeReview = async (transcribedText, restaurantName = 'this restaurant') => {
-  try {
-    const response = await axios.post(
-      'https://api.openai.com/v1/chat/completions',
-      {
-        model: 'gpt-4o-mini',
-        messages: [
-          {
-            role: 'system',
-            content: 'You are a helpful assistant that analyzes restaurant feedback and formats it as a structured review.'
-          },
-          {
-            role: 'user',
-            content: `I want you to analyze my feedback for ${restaurantName}, which features live DJs and music.
-The feedback was: "${transcribedText}"
-
-Format this feedback as a first-person review that I can copy and paste directly to Google Reviews.
-All assessments, opinions, and points should be written in first-person (using "I", "my", "me").
-
-For example, instead of "The customer enjoyed the food" write "I enjoyed the food".
-Instead of "The customer thought the music was too loud" write "I thought the music was too loud".
-
-Provide your analysis in the following JSON format:
-{
-    "summary": "A brief first-person summary of my overall experience",
-    "food_quality": "My assessment of food and drinks",
-    "service": "My assessment of service quality",
-    "atmosphere": "My assessment of ambiance, music, and entertainment",
-    "music_and_entertainment": "My specific feedback on DJs, music selection, and overall vibe",
-    "specific_points": ["My point 1", "My point 2", "My point 3"],
-    "sentiment_score": 4,
-    "improvement_suggestions": ["My suggestion 1", "My suggestion 2"]
-}
-
-MAKE SURE that:
-1. All text fields are properly enclosed in double quotes
-2. All arrays have square brackets and comma-separated values in double quotes
-3. The sentiment_score is a number between 1-5 without quotes
-4. There is no trailing comma after the last item in arrays or objects
-5. Your response contains ONLY the JSON object - no other text before or after`
-          }
-        ],
-        temperature: 0.4
-      },
-      {
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${process.env.REACT_APP_OPENAI_API_KEY}`
-        }
-      }
-    );
-
-    // Extract the JSON response
-    const responseText = response.data.choices[0].message.content;
-    
-    try {
-      // Parse the JSON
-      const parsedResponse = JSON.parse(responseText);
-      
-      // Add raw transcription
-      parsedResponse.raw_transcription = transcribedText;
-      
-      // Return the parsed object
-      return parsedResponse;
-    } catch (parseError) {
-      console.error('Error parsing OpenAI response:', parseError);
-      
-      // Try to extract JSON using regex
-      const jsonPattern = /(\{[\s\S]*\})/;
-      const match = responseText.match(jsonPattern);
-      
-      if (match) {
-        const jsonStr = match[1]
-          .replace(/'/g, '"') // Replace single quotes with double quotes
-          .replace(/([{,]\s*)([a-zA-Z_][a-zA-Z0-9_]*)\s*:/g, '$1"$2":') // Add quotes to keys
-          .replace(/,\s*}/g, '}') // Remove trailing commas before closing braces
-          .replace(/,\s*]/g, ']'); // Remove trailing commas before closing brackets
-        
-        try {
-          const parsedResponse = JSON.parse(jsonStr);
-          parsedResponse.raw_transcription = transcribedText;
-          return parsedResponse;
-        } catch (e) {
-          throw new Error('Failed to parse OpenAI response as JSON');
-        }
-      } else {
-        throw new Error('Failed to extract JSON from OpenAI response');
-      }
-    }
-  } catch (error) {
-    console.error('Error calling OpenAI API:', error);
-    
-    // Create a basic fallback response
-    const sentences = transcribedText.split('.').filter(s => s.trim().length > 0);
-    
-    // Convert sentences to first person if they aren't already
-    const firstPersonSentences = sentences.map(sentence => {
-      const lowerSentence = sentence.toLowerCase();
-      if (!lowerSentence.includes(' i ') && 
-          !lowerSentence.includes(' my ') && 
-          !lowerSentence.includes(' me ') && 
-          !lowerSentence.includes(' we ') && 
-          !lowerSentence.includes(' our ')) {
-        // Convert to first person
-        return `I ${sentence.trim().charAt(0).toLowerCase()}${sentence.trim().slice(1)}`;
-      }
-      return sentence.trim();
-    });
-    
-    const summary = firstPersonSentences[0] || "I visited this restaurant.";
-    
-    // Extract specific points based on sentence length and content
-    const points = [];
-    const suggestions = [];
-    
-    for (const s of firstPersonSentences.slice(1)) {
-      if (s.toLowerCase().includes('should') || 
-          s.toLowerCase().includes('could') || 
-          s.toLowerCase().includes('wish') || 
-          s.toLowerCase().includes('hope')) {
-        suggestions.push(s);
-      } else if (s.length > 15) {
-        points.push(s);
-      }
-    }
-    
-    // Ensure we have at least some points and suggestions
-    if (points.length === 0 && firstPersonSentences.length > 1) {
-      points.push(firstPersonSentences[1]);
-    }
-    
-    if (suggestions.length === 0 && points.length > 0) {
-      suggestions.push("I hope they continue providing this quality of experience.");
-    }
-    
-    return {
-      summary,
-      food_quality: transcribedText.toLowerCase().includes('food') 
-        ? "I enjoyed the food based on my visit." 
-        : "N/A",
-      service: transcribedText.toLowerCase().includes('service') 
-        ? "The service was good during my visit." 
-        : "N/A",
-      atmosphere: transcribedText.toLowerCase().includes('atmosphere') 
-        ? "I liked the atmosphere of the place." 
-        : "N/A",
-      music_and_entertainment: ['music', 'dj', 'entertainment'].some(term => 
-        transcribedText.toLowerCase().includes(term)) 
-        ? "The music added to my experience." 
-        : "N/A",
-      specific_points: points.slice(0, 3).length > 0 
-        ? points.slice(0, 3) 
-        : ["I had an experience worth sharing."],
-      sentiment_score: ['good', 'great', 'excellent', 'amazing', 'enjoyed'].some(term => 
-        transcribedText.toLowerCase().includes(term)) 
-        ? 4 
-        : 3,
-      improvement_suggestions: suggestions.slice(0, 2).length > 0 
-        ? suggestions.slice(0, 2) 
-        : ["Based on my experience, I think they're doing well."],
-      raw_transcription: transcribedText
-    };
-  }
+// Fallback transcription 
+export const fallbackTranscription = () => {
+  console.log('Using fallback transcription mechanism');
+  
+  // Return a message that's clearly different from actual transcription
+  return "TRANSCRIPTION_FAILED: Unable to convert speech to text. Please try again.";
 };
